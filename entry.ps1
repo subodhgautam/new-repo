@@ -94,3 +94,213 @@ foreach ($task in $tasks) {
 
         function Set-WorkerStatus([string]$State, [string]$Detail) {
             $obj = [pscustomobject]@{
+                Name = $Name
+                State = $State
+                Detail = $Detail
+                Started = $script:StartedAt
+                Finished = if ($State -in @("Succeeded", "Failed")) { (Get-Date).ToString("s") } else { $null }
+            }
+            $temp = "$StatusPath.tmp"
+            $obj | ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding UTF8
+            Move-Item -LiteralPath $temp -Destination $StatusPath -Force
+        }
+
+        function Invoke-Installer {
+            param([string]$FilePath, [string]$Arguments = "")
+            Write-WorkerLog "Launching: $([IO.Path]::GetFileName($FilePath)) $Arguments"
+            if ($Arguments) {
+                $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -Wait
+            } else {
+                $p = Start-Process -FilePath $FilePath -PassThru -Wait
+            }
+            Write-WorkerLog "Installer process exited with code $($p.ExitCode)"
+            if ($p.ExitCode -notin @(0, 1641, 3010)) {
+                throw "Installer returned exit code $($p.ExitCode)"
+            }
+        }
+
+        $script:StartedAt = (Get-Date).ToString("s")
+        try {
+            Set-WorkerStatus "Running" "Worker started"
+            Write-WorkerLog "WORKER STARTED. Kind=$Kind; Payload=$PayloadPath"
+
+            if (-not (Test-Path -LiteralPath $PayloadPath -PathType Leaf)) {
+                throw "Payload not found: $PayloadPath"
+            }
+
+            switch ($Kind) {
+                "Office" {
+                    Invoke-Installer -FilePath $PayloadPath
+                }
+                "Chrome" {
+                    Invoke-Installer -FilePath $PayloadPath -Arguments "/silent /install"
+                }
+                "AnyDesk" {
+                    $anyDeskDir = Join-Path ${env:ProgramFiles(x86)} "AnyDesk"
+                    Invoke-Installer -FilePath $PayloadPath -Arguments "--install `"$anyDeskDir`" --silent"
+                }
+                "WinRAR" {
+                    Invoke-Installer -FilePath $PayloadPath -Arguments "/S"
+                }
+                "Fonts" {
+                    $dest = Join-Path $ExtractRoot "fonts"
+                    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                    Expand-Archive -LiteralPath $PayloadPath -DestinationPath $dest -Force
+                    $fontFiles = @(Get-ChildItem -LiteralPath $dest -Recurse -File |
+                        Where-Object { $_.Extension -match '^\.(ttf|otf|ttc)$' })
+                    if ($fontFiles.Count -eq 0) { throw "No TTF, OTF, or TTC files found in fonts.zip" }
+
+                    $userFontDir = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Fonts"
+                    New-Item -ItemType Directory -Path $userFontDir -Force | Out-Null
+                    $fontReg = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts"
+                    New-Item -Path $fontReg -Force | Out-Null
+
+                    Add-Type -AssemblyName System.Drawing
+                    $installed = 0
+                    foreach ($font in $fontFiles) {
+                        $target = Join-Path $userFontDir $font.Name
+                        Copy-Item -LiteralPath $font.FullName -Destination $target -Force
+
+                        $familyName = [IO.Path]::GetFileNameWithoutExtension($font.Name)
+                        $collection = New-Object System.Drawing.Text.PrivateFontCollection
+                        try {
+                            $collection.AddFontFile($target)
+                            if ($collection.Families.Count -gt 0) {
+                                $familyName = $collection.Families[0].Name
+                            }
+                        } catch {
+                            Write-WorkerLog "Could not read embedded font family name for $($font.Name); using filename."
+                        } finally {
+                            $collection.Dispose()
+                        }
+
+                        $formatName = if ($font.Extension -eq ".otf") { "OpenType" } else { "TrueType" }
+                        New-ItemProperty -Path $fontReg -Name "$familyName ($formatName)" `
+                            -Value $font.Name -PropertyType String -Force | Out-Null
+                        $installed++
+                    }
+
+                    # Notify Windows that the font table changed.
+                    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class FontBroadcast {
+    [DllImport("gdi32.dll", CharSet=CharSet.Unicode)]
+    public static extern int AddFontResourceW(string fileName);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr SendMessageTimeout(
+        IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
+        uint fuFlags, uint uTimeout, out UIntPtr result);
+}
+"@ -ErrorAction SilentlyContinue
+
+                    foreach ($font in $fontFiles) {
+                        [void][FontBroadcast]::AddFontResourceW((Join-Path $userFontDir $font.Name))
+                    }
+                    $result = [UIntPtr]::Zero
+                    [void][FontBroadcast]::SendMessageTimeout(
+                        [IntPtr]0xffff, 0x001D, [UIntPtr]::Zero, $null, 2, 1000, [ref]$result
+                    )
+                    Write-WorkerLog "Processed $installed font files into the current user's Fonts directory."
+                }
+                "Nepali" {
+                    $dest = Join-Path $ExtractRoot "nepali_romanised"
+                    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                    Expand-Archive -LiteralPath $PayloadPath -DestinationPath $dest -Force
+
+                    $setups = @(Get-ChildItem -LiteralPath $dest -Recurse -File |
+                        Where-Object { $_.Extension -in @(".exe", ".msi") })
+                    if ($setups.Count -ne 1) {
+                        throw "Expected exactly one .exe or .msi installer in nepali_romanised.zip; found $($setups.Count)."
+                    }
+                    if ($setups[0].Extension -eq ".msi") {
+                        Invoke-Installer -FilePath "msiexec.exe" -Arguments "/i `"$($setups[0].FullName)`" /qn /norestart"
+                    } else {
+                        Invoke-Installer -FilePath $setups[0].FullName
+                    }
+                }
+                default {
+                    throw "Unknown worker kind: $Kind"
+                }
+            }
+
+            Set-WorkerStatus "Succeeded" "Installer process completed"
+            Write-WorkerLog "WORKER FINISHED."
+        }
+        catch {
+            $message = $_.Exception.Message
+            try { Write-WorkerLog "ERROR: $message" } catch {}
+            try { Set-WorkerStatus "Failed" $message } catch {}
+            throw
+        }
+    }
+
+    $jobs += [pscustomobject]@{
+        Name = $task.Name
+        Job = $job
+        StatusPath = $statusPath
+        LogPath = $logPath
+        LogOffset = 0
+    }
+    Write-Host "[STARTED] $($task.Name) (Job ID: $($job.Id))" -ForegroundColor Green
+}
+
+Write-Section "MONITORING WORKERS"
+
+$completed = $false
+while (-not $completed) {
+    $completed = $true
+    $lines = @()
+
+    foreach ($entry in $jobs) {
+        $jobState = $entry.Job.State
+        if ($jobState -in @("NotStarted", "Running", "Blocked", "AtBreakpoint")) {
+            $completed = $false
+        }
+
+        if (Test-Path $entry.LogPath) {
+            $allLines = @(Get-Content -LiteralPath $entry.LogPath)
+            if ($allLines.Count -gt $entry.LogOffset) {
+                for ($i = $entry.LogOffset; $i -lt $allLines.Count; $i++) {
+                    Write-Host "[$($entry.Name)] $($allLines[$i])"
+                }
+                $entry.LogOffset = $allLines.Count
+            }
+        }
+
+        $state = $jobState
+        $detail = "Worker process: $jobState"
+        if (Test-Path $entry.StatusPath) {
+            try {
+                $status = Get-Content -LiteralPath $entry.StatusPath -Raw | ConvertFrom-Json
+                $state = $status.State
+                $detail = $status.Detail
+            } catch {}
+        }
+        Write-Progress -Id 1 -Activity "Software setup" `
+            -Status "$($entry.Name): $state — $detail" `
+            -PercentComplete ((@($jobs | Where-Object { $_.Job.State -in @("Completed","Failed","Stopped") }).Count / $jobs.Count) * 100)
+    }
+
+    if (-not $completed) { Start-Sleep -Seconds 1 }
+}
+
+# Flush any final log lines.
+foreach ($entry in $jobs) {
+    if (Test-Path $entry.LogPath) {
+        $allLines = @(Get-Content -LiteralPath $entry.LogPath)
+        for ($i = $entry.LogOffset; $i -lt $allLines.Count; $i++) {
+            Write-Host "[$($entry.Name)] $($allLines[$i])"
+        }
+        $entry.LogOffset = $allLines.Count
+    }
+    Receive-Job -Job $entry.Job -ErrorAction SilentlyContinue | Out-Null
+}
+Write-Progress -Id 1 -Activity "Software setup" -Completed
+
+Write-Section "FINAL VERIFICATION"
+& $VerifyScript -Root $WorkRoot
+
+Write-Section "SETUP FINISHED"
+Write-Host "Logs and downloaded files: $WorkRoot" -ForegroundColor DarkCyan
+Write-Host "If an item failed verification, inspect its log in: $LogsDir"
