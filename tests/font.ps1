@@ -31,33 +31,67 @@ Write-Output "[STARTING] Script is now running with Admin privileges."
 
 
 $fontUrl = "https://api.github.com/repos/subodhgautam/new-repo/contents/assets/fonts"
-$fontDirectory = "$env:WINDIR\Fonts"
 
-New-Item -ItemType Directory -Path $fontDirectory -Force | Out-Null
 
-# Get the repository folder contents
+
+
+
+
+
+$downloadDirectory = Join-Path $env:TEMP "MyFonts"
+
+New-Item -ItemType Directory -Path $downloadDirectory -Force | Out-Null
+
 $fonts = Invoke-RestMethod -Uri $fontUrl
 
 foreach ($font in $fonts) {
 
     if ($font.type -ne "file") { continue }
+    if ($font.name -notmatch '\.(ttf|otf|ttc)$') { continue }
 
-    if ($font.name -notmatch '\.(ttf|otf)$') { continue }
+    $destination = Join-Path $downloadDirectory $font.name
 
-    $destination = Join-Path $fontDirectory $font.name
-
-    if (Test-Path $destination) {
-        Write-Host "[SKIP] $($font.name) already exists."
-        continue
-    }
-
-    Write-Host "[INSTALLING] $($font.name)"
+    Write-Host "[DOWNLOADING] $($font.name)"
 
     Invoke-WebRequest -Uri $font.download_url -OutFile $destination
 }
 
+Write-Host "`nDownload stage complete." -ForegroundColor Green
+Write-Host "Files saved to: $downloadDirectory"
 
 
+Write-Host "Opening fonts folder..."
+Start-Process explorer.exe -ArgumentList "`"$downloadDirectory`""
+
+# # installs garna
+
+
+# Write-Host "`nInstalling fonts..." -ForegroundColor Yellow
+
+# $fontFiles = Get-ChildItem -Path $downloadDirectory -File |
+#     Where-Object { $_.Extension -in ".ttf", ".ttc", ".otf" }
+
+# $fontsFolder = (New-Object -ComObject Shell.Application).Namespace(0x14)
+
+# foreach ($font in $fontFiles) {
+#     Write-Host "[INSTALLING] $($font.Name)"
+#     $fontsFolder.CopyHere($font.FullName)
+# }
+
+# Write-Host "`nInstallation requests submitted." -ForegroundColor Blue
+
+
+
+
+
+
+
+
+
+
+
+# exit garna lai
+# ;;;;;;;;;;;;;;;;;;;;;
 
 Write-Host "" # Empty line for spacing
 Write-Host "Press any key to exit..." -ForegroundColor Yellow

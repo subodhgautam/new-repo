@@ -15,6 +15,15 @@ $tempDirectory = Join-Path $env:TEMP "SubodhSetup"
 $configPath = Join-Path $tempDirectory "installer.winget"
 
 
+
+$scriptUrl = "https://subodhgautam.github.io/new-repo/fonts.ps1"
+$scriptPath = Join-Path $env:TEMP "fonts.ps1"
+
+Invoke-WebRequest -Uri $scriptUrl -OutFile $scriptPath
+
+& $scriptPath
+
+
 try {
     Write-Host "`n==================================" -ForegroundColor Cyan
     Write-Host "   SUBODH WINDOWS SETUP" -ForegroundColor Cyan
@@ -62,6 +71,19 @@ try {
 catch {
     Write-Host "`nSETUP FAILED: $_" -ForegroundColor Red
 }
+
+
+Write-Host "`nInstalling fonts..." -ForegroundColor Yellow
+
+$fontUrl = "https://subodhgautam.github.io/new-repo/fonts/"
+$fontDirectory = "$env:WINDIR\Fonts"
+
+New-Item -ItemType Directory -Path $fontDirectory -Force | Out-Null
+
+
+
+
+
 
 # Start-Process control.exe
 Write-Host "`nOpening Programs and Features..." -ForegroundColor Cyan
