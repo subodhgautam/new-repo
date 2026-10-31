@@ -1,0 +1,38 @@
+# uses the .yaml as a instructor telling what to install,
+# this is the setup installer.
+
+
+
+# yaml-language-server: $schema=https://aka.ms/configuration-dsc-schema/0.2
+
+properties:
+  configurationVersion: 0.2.0
+  resources:
+
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: Chrome
+      directives:
+        description: Install Google Chrome
+      settings:
+        id: Google.Chrome
+        source: winget
+
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: AnyDesk
+      directives:
+        description: Install AnyDesk
+      settings:
+        id: AnyDesk.AnyDesk
+        source: winget
+
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: WinRAR
+      directives:
+        description: Install WinRAR
+      settings:
+        id: RARLab.WinRAR
+        source: winget
+
+
+# run command
+# winget configure --file .\basic-setup.winget
