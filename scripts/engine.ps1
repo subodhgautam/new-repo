@@ -72,7 +72,9 @@ $workerScript = {
 
     function Write-WorkerLog([string]$Message) {
         $stamp = Get-Date -Format "HH:mm:ss"
-        Add-Content -LiteralPath $LogPath -Value "[$stamp] $Message"
+        # Keep every log entry on a single line so the monitor output stays readable.
+        $clean = ($Message -replace "\s*\r?\n\s*", " ").Trim()
+        Add-Content -LiteralPath $LogPath -Value "[$stamp] $clean"
     }
 
     function Set-WorkerStatus([string]$State, [string]$Detail) {
@@ -85,34 +87,79 @@ $workerScript = {
         }
         $temp = "$StatusPath.tmp"
         $obj | ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding UTF8
-        Move-Item -LiteralPath $temp -Destination $StatusPath -Force
+        try {
+            Move-Item -LiteralPath $temp -Destination $StatusPath -Force -ErrorAction Stop
+        } catch {
+            # Antivirus occasionally holds the status file for a moment; copy instead of failing the worker.
+            Copy-Item -LiteralPath $temp -Destination $StatusPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+        }
     }
 
     function Invoke-Download {
-        param([string]$Uri, [string]$Destination)
+        param(
+            [string]$Uri,
+            [string]$Destination,
+            [long]$MinBytes = 1024
+        )
 
         $parent = Split-Path -Parent $Destination
         if ($parent -and -not (Test-Path -LiteralPath $parent)) {
             New-Item -ItemType Directory -Path $parent -Force | Out-Null
         }
-        $part = "$Destination.part"
 
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
-            try {
-                Write-WorkerLog "DOWNLOADING $Uri"
-                Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
-                Invoke-WebRequest -Uri $Uri -OutFile $part -UseBasicParsing
-
-                $item = Get-Item -LiteralPath $part -ErrorAction Stop
-                if ($item.Length -le 0) { throw "Downloaded file is empty" }
-
-                Move-Item -LiteralPath $part -Destination $Destination -Force
-                Write-WorkerLog ("DOWNLOADED {0} ({1} MB)" -f [IO.Path]::GetFileName($Destination), [Math]::Round($item.Length / 1MB, 1))
+        # Reuse a payload that a previous run already downloaded instead of fetching it again.
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            $existing = Get-Item -LiteralPath $Destination
+            if ($existing.Length -ge $MinBytes) {
+                Write-WorkerLog ("REUSING cached {0} ({1} MB)" -f $existing.Name, [Math]::Round($existing.Length / 1MB, 1))
                 return
+            }
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        }
+
+        # Phase 1: download to a unique .part file (only this phase may retry the network).
+        # A unique name avoids being blocked by a stale, still-locked part file from an earlier run.
+        $part = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $candidate = "$Destination.$([Guid]::NewGuid().ToString('N')).part"
+            try {
+                Write-WorkerLog "DOWNLOADING $Uri (attempt $attempt/3)"
+                # WebClient is considerably faster than Invoke-WebRequest under PowerShell 5.1.
+                $client = New-Object System.Net.WebClient
+                try {
+                    $client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    $client.DownloadFile($Uri, $candidate)
+                } finally {
+                    $client.Dispose()
+                }
+
+                $item = Get-Item -LiteralPath $candidate -ErrorAction Stop
+                if ($item.Length -lt $MinBytes) { throw "Downloaded file is too small ($($item.Length) bytes)" }
+                $part = $candidate
+                break
             } catch {
+                Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
                 Write-WorkerLog "Download attempt $attempt failed: $($_.Exception.Message)"
                 if ($attempt -eq 3) { throw }
                 Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
+
+        # Phase 2: place the finished download. A failed move must never trigger a re-download.
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $Destination) {
+                    Remove-Item -LiteralPath $Destination -Force -ErrorAction Stop
+                }
+                [IO.File]::Move($part, $Destination)
+                $size = (Get-Item -LiteralPath $Destination).Length
+                Write-WorkerLog ("DOWNLOADED {0} ({1} MB)" -f [IO.Path]::GetFileName($Destination), [Math]::Round($size / 1MB, 1))
+                return
+            } catch {
+                Write-WorkerLog "Could not move download into place (attempt $attempt/3): $($_.Exception.Message)"
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Seconds 2
             }
         }
     }
@@ -122,18 +169,32 @@ $workerScript = {
             [string]$FilePath,
             [string]$Arguments = "",
             [string]$WorkingDirectory = "",
-            [int[]]$AllowedExitCodes = @(0, 1641, 3010)
+            [int[]]$AllowedExitCodes = @(0, 1641, 3010),
+            [int]$TimeoutSeconds = 0
         )
         Write-WorkerLog "Launching: $([IO.Path]::GetFileName($FilePath)) $Arguments"
-        $startParams = @{ FilePath = $FilePath; PassThru = $true; Wait = $true }
+        $startParams = @{ FilePath = $FilePath; PassThru = $true }
         if ($Arguments) { $startParams.ArgumentList = $Arguments }
         if ($WorkingDirectory) { $startParams.WorkingDirectory = $WorkingDirectory }
         $p = Start-Process @startParams
-        Write-WorkerLog "Installer process exited with code $($p.ExitCode)"
-        if ($p.ExitCode -notin $AllowedExitCodes) {
-            throw "Installer returned exit code $($p.ExitCode)"
+
+        # Never let an installer that opens a hidden/interactive window freeze the whole run.
+        if ($TimeoutSeconds -gt 0) {
+            if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+                try { $p.Kill() } catch {}
+                throw "$([IO.Path]::GetFileName($FilePath)) did not finish within $TimeoutSeconds seconds."
+            }
+        } else {
+            $p.WaitForExit()
         }
-        return $p.ExitCode
+
+        $p.Refresh()
+        $code = $p.ExitCode
+        Write-WorkerLog "Installer process exited with code $code"
+        if ($code -notin $AllowedExitCodes) {
+            throw "Installer returned exit code $code"
+        }
+        return $code
     }
 
     function Test-OfficeInstalled {
@@ -169,8 +230,56 @@ $workerScript = {
         return $false
     }
 
+    function Test-AnyDeskInstalled {
+        $paths = @()
+        if (${env:ProgramFiles(x86)}) {
+            $paths += Join-Path ${env:ProgramFiles(x86)} "AnyDesk\AnyDesk.exe"
+        }
+        if ($env:ProgramFiles) {
+            $paths += Join-Path $env:ProgramFiles "AnyDesk\AnyDesk.exe"
+        }
+        foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) { return $true }
+        }
+        return $false
+    }
+
+    function Test-WinRARInstalled {
+        $paths = @()
+        if ($env:ProgramFiles) {
+            $paths += Join-Path $env:ProgramFiles "WinRAR\WinRAR.exe"
+        }
+        if (${env:ProgramFiles(x86)}) {
+            $paths += Join-Path ${env:ProgramFiles(x86)} "WinRAR\WinRAR.exe"
+        }
+        foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) { return $true }
+        }
+        return $false
+    }
+
+    function Expand-ArchiveFast([string]$ZipPath, [string]$Destination) {
+        # ZipFile.ExtractToDirectory is far faster than Expand-Archive on Windows PowerShell 5.1.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+    }
+
     $script:StartedAt = (Get-Date).ToString("s")
     try {
+        # Check before downloading: skip the payload entirely when the app is already present.
+        $alreadyInstalled = switch ($Kind) {
+            "Office"  { Test-OfficeInstalled }
+            "Chrome"  { Test-ChromeInstalled }
+            "AnyDesk" { Test-AnyDeskInstalled }
+            "WinRAR"  { Test-WinRARInstalled }
+            default   { $false }
+        }
+        if ($alreadyInstalled) {
+            Write-WorkerLog "$Kind is already installed; skipping download and installer."
+            Set-WorkerStatus "Succeeded" "Already installed"
+            return
+        }
+
         Set-WorkerStatus "Downloading" "Fetching $([IO.Path]::GetFileName($PayloadPath))"
         Write-WorkerLog "WORKER STARTED. Kind=$Kind; Url=$Url"
 
@@ -187,11 +296,6 @@ $workerScript = {
 
         switch ($Kind) {
             "Office" {
-                if (Test-OfficeInstalled) {
-                    Write-WorkerLog "Office is already installed; skipping installer."
-                    Set-WorkerStatus "Succeeded" "Already installed"
-                    return
-                }
                 $configPath = Join-Path $Root "office-config.xml"
                 $configXml = @(
                     '<Configuration>'
@@ -208,7 +312,7 @@ $workerScript = {
                 Set-Content -LiteralPath $configPath -Value $configXml -Encoding ASCII
                 Write-WorkerLog "Using silent Office configuration: Product=$OfficeProductId; Language=$OfficeLanguage"
                 try {
-                    Invoke-Installer -FilePath $PayloadPath -Arguments "/configure `"$configPath`""
+                    Invoke-Installer -FilePath $PayloadPath -Arguments "/configure `"$configPath`"" -TimeoutSeconds 3600
                 } catch {
                     if (Test-OfficeInstalled) {
                         Write-WorkerLog "Office installer reported an error, but Office is present; continuing."
@@ -218,15 +322,10 @@ $workerScript = {
                 }
             }
             "Chrome" {
-                if (Test-ChromeInstalled) {
-                    Write-WorkerLog "Chrome is already installed; skipping installer."
-                    Set-WorkerStatus "Succeeded" "Already installed"
-                    return
-                }
                 $chromeOk = $false
                 for ($attempt = 1; $attempt -le 2; $attempt++) {
                     try {
-                        Invoke-Installer -FilePath $PayloadPath -Arguments "/silent /install"
+                        Invoke-Installer -FilePath $PayloadPath -Arguments "/silent /install" -TimeoutSeconds 900
                     } catch {
                         Write-WorkerLog "Chrome installer attempt $attempt reported: $($_.Exception.Message)"
                     }
@@ -249,10 +348,10 @@ $workerScript = {
             }
             "AnyDesk" {
                 $anyDeskDir = Join-Path ${env:ProgramFiles(x86)} "AnyDesk"
-                Invoke-Installer -FilePath $PayloadPath -Arguments "--install `"$anyDeskDir`" --silent"
+                Invoke-Installer -FilePath $PayloadPath -Arguments "--install `"$anyDeskDir`" --silent" -TimeoutSeconds 300
             }
             "WinRAR" {
-                Invoke-Installer -FilePath $PayloadPath -Arguments "/S"
+                Invoke-Installer -FilePath $PayloadPath -Arguments "/S" -TimeoutSeconds 300
             }
             "Fonts" {
                 Set-WorkerStatus "Installing" "Extracting and registering fonts"
@@ -261,7 +360,7 @@ $workerScript = {
                     Remove-Item -LiteralPath $dest -Recurse -Force
                 }
                 New-Item -ItemType Directory -Path $dest -Force | Out-Null
-                Expand-Archive -LiteralPath $PayloadPath -DestinationPath $dest -Force
+                Expand-ArchiveFast -ZipPath $PayloadPath -Destination $dest
                 $fontFiles = @(Get-ChildItem -LiteralPath $dest -Recurse -File |
                     Where-Object { $_.Extension -match '^\.(ttf|otf|ttc)$' })
                 if ($fontFiles.Count -eq 0) { throw "No TTF, OTF, or TTC files found in fonts.zip" }
@@ -273,9 +372,36 @@ $workerScript = {
 
                 Add-Type -AssemblyName System.Drawing
                 $installed = 0
+                $skipped = 0
+                $failed = 0
                 foreach ($font in $fontFiles) {
                     $target = Join-Path $userFontDir $font.Name
-                    Copy-Item -LiteralPath $font.FullName -Destination $target -Force
+
+                    # Never overwrite a font Windows may already have loaded: that is what
+                    # produced "file is being used by another process" on re-runs.
+                    if (Test-Path -LiteralPath $target -PathType Leaf) {
+                        $existing = Get-Item -LiteralPath $target
+                        if ($existing.Length -eq $font.Length) {
+                            $skipped++
+                        } else {
+                            try {
+                                Copy-Item -LiteralPath $font.FullName -Destination $target -Force -ErrorAction Stop
+                                $installed++
+                            } catch {
+                                Write-WorkerLog "Font $($font.Name) is already loaded; keeping the existing copy."
+                                $skipped++
+                            }
+                        }
+                    } else {
+                        try {
+                            Copy-Item -LiteralPath $font.FullName -Destination $target -Force -ErrorAction Stop
+                            $installed++
+                        } catch {
+                            Write-WorkerLog "FAILED to copy font $($font.Name): $($_.Exception.Message)"
+                            $failed++
+                            continue
+                        }
+                    }
 
                     $familyName = [IO.Path]::GetFileNameWithoutExtension($font.Name)
                     $collection = New-Object System.Drawing.Text.PrivateFontCollection
@@ -291,13 +417,18 @@ $workerScript = {
                     }
 
                     $formatName = if ($font.Extension -eq ".otf") { "OpenType" } else { "TrueType" }
-                    New-ItemProperty -Path $fontReg -Name "$familyName ($formatName)" `
-                        -Value $font.Name -PropertyType String -Force | Out-Null
-                    $installed++
+                    try {
+                        New-ItemProperty -Path $fontReg -Name "$familyName ($formatName)" `
+                            -Value $font.Name -PropertyType String -Force -ErrorAction Stop | Out-Null
+                    } catch {
+                        Write-WorkerLog "FAILED to register font $($font.Name): $($_.Exception.Message)"
+                        $failed++
+                    }
                 }
 
                 # Notify Windows that the font table changed.
-                Add-Type @"
+                if (-not ([System.Management.Automation.PSTypeName]'FontBroadcast').Type) {
+                    Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public static class FontBroadcast {
@@ -308,16 +439,19 @@ public static class FontBroadcast {
         IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam,
         uint fuFlags, uint uTimeout, out UIntPtr result);
 }
-"@ -ErrorAction SilentlyContinue
+"@
+                }
 
                 foreach ($font in $fontFiles) {
-                    [void][FontBroadcast]::AddFontResourceW((Join-Path $userFontDir $font.Name))
+                    try {
+                        [void][FontBroadcast]::AddFontResourceW((Join-Path $userFontDir $font.Name))
+                    } catch {}
                 }
                 $result = [UIntPtr]::Zero
                 [void][FontBroadcast]::SendMessageTimeout(
                     [IntPtr]0xffff, 0x001D, [UIntPtr]::Zero, $null, 2, 1000, [ref]$result
                 )
-                Write-WorkerLog "Processed $installed font files into the current user's Fonts directory."
+                Write-WorkerLog "Fonts: $installed new, $skipped already present, $failed failed."
             }
             "Nepali" {
                 Set-WorkerStatus "Installing" "Extracting and running Nepali Romanized setup"
@@ -329,29 +463,30 @@ public static class FontBroadcast {
 
                 # Multi-file bootstrapper: setup.exe needs its sibling
                 # roman_<arch>.msi files and the per-architecture DLLs.
-                Expand-Archive -LiteralPath $PayloadPath -DestinationPath $dest -Force
+                Expand-ArchiveFast -ZipPath $PayloadPath -Destination $dest
                 Write-WorkerLog "Extracted archive to $dest"
 
-                $setup = Get-ChildItem -LiteralPath $dest -Recurse -File |
-                    Where-Object { $_.Name -ieq "setup.exe" } |
-                    Sort-Object { $_.FullName.Length } |
+                # Prefer the bundled MSI: it installs silently and never blocks waiting for UI.
+                $msiName = if ([Environment]::Is64BitOperatingSystem) { "Roman_amd64.msi" } else { "Roman_i386.msi" }
+                $msi = Get-ChildItem -LiteralPath $dest -Recurse -File |
+                    Where-Object { $_.Name -ieq $msiName } |
                     Select-Object -First 1
 
-                if ($null -eq $setup) {
-                    $msiName = if ([Environment]::Is64BitOperatingSystem) { "Roman_amd64.msi" } else { "Roman_i386.msi" }
-                    $msi = Get-ChildItem -LiteralPath $dest -Recurse -File |
-                        Where-Object { $_.Name -ieq $msiName } |
+                if ($null -ne $msi) {
+                    Write-WorkerLog "Installing $($msi.Name) silently."
+                    Invoke-Installer -FilePath "msiexec.exe" `
+                        -Arguments "/i `"$($msi.FullName)`" /qn /norestart" -TimeoutSeconds 900
+                } else {
+                    $setup = Get-ChildItem -LiteralPath $dest -Recurse -File |
+                        Where-Object { $_.Name -ieq "setup.exe" } |
+                        Sort-Object { $_.FullName.Length } |
                         Select-Object -First 1
-                    if ($null -eq $msi) {
+                    if ($null -eq $setup) {
                         throw "No setup.exe or $msiName found after extracting nepali_romanised.zip."
                     }
-                    Write-WorkerLog "setup.exe not found; installing $($msi.Name) directly."
-                    Invoke-Installer -FilePath "msiexec.exe" `
-                        -Arguments "/i `"$($msi.FullName)`" /qn /norestart"
-                } else {
-                    Write-WorkerLog "Running setup.exe from $($setup.DirectoryName)"
+                    Write-WorkerLog "Running setup.exe silently from $($setup.DirectoryName)"
                     Invoke-Installer -FilePath $setup.FullName `
-                        -WorkingDirectory $setup.DirectoryName
+                        -Arguments "/S" -WorkingDirectory $setup.DirectoryName -TimeoutSeconds 900
                 }
             }
             default {
@@ -470,7 +605,7 @@ while (-not $completed) {
         if (-not $isDone) { $completed = $false }
 
         if (Test-Path $entry.LogPath) {
-            $allLines = @(Get-Content -LiteralPath $entry.LogPath)
+            $allLines = @(Get-Content -LiteralPath $entry.LogPath -ErrorAction SilentlyContinue)
             if ($allLines.Count -gt $entry.LogOffset) {
                 for ($i = $entry.LogOffset; $i -lt $allLines.Count; $i++) {
                     Write-Host "[$($entry.Name)] $($allLines[$i])"
@@ -501,7 +636,7 @@ while (-not $completed) {
 # Flush any final log lines and clean up workers.
 foreach ($entry in $jobs) {
     if (Test-Path $entry.LogPath) {
-        $allLines = @(Get-Content -LiteralPath $entry.LogPath)
+        $allLines = @(Get-Content -LiteralPath $entry.LogPath -ErrorAction SilentlyContinue)
         for ($i = $entry.LogOffset; $i -lt $allLines.Count; $i++) {
             Write-Host "[$($entry.Name)] $($allLines[$i])"
         }
