@@ -1,17 +1,5 @@
 
  
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-# 2. If not admin, relaunch this exact script with elevated privileges
-if (-not $isAdmin) {
-    Write-Warning "Admin privileges missing. Launching an elevated session..."
-    
-    # Start a new PowerShell process as Administrator, passing this script's path
-    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -NoExit -Command `"$PSCommandPath`"" -Verb RunAs
-    
-    # Close the current non-admin console
-    Exit
-}
 
  
 Write-Output "[STARTING] Script is now running with Admin privileges."
@@ -48,11 +36,3 @@ Start-Process explorer.exe -ArgumentList "`"$downloadDirectory`""
 
 
 
-# exit garna lai
-# ;;;;;;;;;;;;;;;;;;;;;
-
-Write-Host "" # Empty line for spacing
-Write-Host "Press any key to exit..." -ForegroundColor Yellow
-
-# This reads a single keypress from the console
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

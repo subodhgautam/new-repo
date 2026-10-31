@@ -9,13 +9,13 @@ properties:
   configurationVersion: 0.2.0
   resources:
 
-    - resource: Microsoft.WinGet.DSC/WinGetPackage
-      id: Chrome
-      directives:
-        description: Install Google Chrome
-      settings:
-        id: Google.Chrome
-        source: winget
+    # - resource: Microsoft.WinGet.DSC/WinGetPackage
+    #   id: Chrome
+    #   directives:
+    #     description: Install Google Chrome
+    #   settings:
+    #     id: Google.Chrome
+    #     source: winget
 
     - resource: Microsoft.WinGet.DSC/WinGetPackage
       id: AnyDesk
@@ -32,6 +32,21 @@ properties:
       settings:
         id: RARLab.WinRAR
         source: winget
+
+
+# yaml-language-server: $schema=https://aka.ms/configuration-dsc-schema/0.2
+
+# Subodh's Windows Setup
+# Desired applications for this computer.
+
+
+   
+
+   
+
+
+
+
 
 
 # run command
