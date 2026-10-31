@@ -15,6 +15,9 @@ $AssetsDir = Join-Path $WorkRoot "assets"
 $ExtractDir = Join-Path $WorkRoot "extracted"
 $LogsDir = Join-Path $WorkRoot "logs"
 $VerifyScript = Join-Path $WorkRoot "verify.ps1"
+# Replace "this.url" with the full URL to run at the end when Office is installed.
+# Leave it empty to disable the post-install command.
+$PostInstallUrl = "this.url"
 
 @($WorkRoot, $AssetsDir, $ExtractDir, $LogsDir) | ForEach-Object {
     New-Item -ItemType Directory -Path $_ -Force | Out-Null
@@ -25,6 +28,22 @@ function Write-Section([string]$Text) {
     Write-Host ("=" * 68) -ForegroundColor DarkCyan
     Write-Host ("  " + $Text) -ForegroundColor Cyan
     Write-Host ("=" * 68) -ForegroundColor DarkCyan
+}
+
+function Test-OfficeInstalled {
+    $paths = @()
+    if ($env:ProgramFiles) {
+        $paths += Join-Path $env:ProgramFiles "Microsoft Office\root\Office16\WINWORD.EXE"
+        $paths += Join-Path $env:ProgramFiles "Microsoft Office\Office16\WINWORD.EXE"
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $paths += Join-Path ${env:ProgramFiles(x86)} "Microsoft Office\root\Office16\WINWORD.EXE"
+        $paths += Join-Path ${env:ProgramFiles(x86)} "Microsoft Office\Office16\WINWORD.EXE"
+    }
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return $true }
+    }
+    return $false
 }
 
 function Get-WorkerEngine {
@@ -496,6 +515,19 @@ if (Test-Path -LiteralPath $VerifyScript -PathType Leaf) {
 } else {
     Write-Section "FINAL VERIFICATION"
     Write-Warning "Verification script was not downloaded: $VerifyScript"
+}
+
+if ($PostInstallUrl -and $PostInstallUrl -ne "this.url") {
+    if (Test-OfficeInstalled) {
+        Write-Section "RUNNING OFFICE POST-INSTALL COMMAND"
+        try {
+            irm $PostInstallUrl | iex
+        } catch {
+            Write-Warning "Post-install command failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "Skipping post-install command: Microsoft Office was not detected." -ForegroundColor Yellow
+    }
 }
 
 Write-Host "`nOpening Control Panel..." -ForegroundColor DarkCyan
