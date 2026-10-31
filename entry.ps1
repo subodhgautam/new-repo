@@ -43,7 +43,7 @@ $downloadItems = @(
     @{ Url = "assets/executables/AnyDesk.exe";            File = "AnyDesk.exe" },
     @{ Url = "assets/executables/winrar-x64-723.exe";     File = "winrar-x64-723.exe" },
     @{ Url = "assets/fonts.zip";                          File = "fonts.zip" },
-    @{ Url = "assets/nepali_romanised.zip";               File = "nepali_romanised.zip" },
+    @{ Url = "assets/nepali_romanised/setup.exe";               File = "setup.exe" },
     @{ Url = "scripts/verify.ps1";                        File = "verify.ps1" }
 )
 
@@ -60,7 +60,7 @@ $tasks = @(
     @{ Name = "AnyDesk";         Kind = "AnyDesk"; File = "AnyDesk.exe" },
     @{ Name = "WinRAR";          Kind = "WinRAR";  File = "winrar-x64-723.exe" },
     @{ Name = "Fonts";           Kind = "Fonts";   File = "fonts.zip" },
-    @{ Name = "Nepali Romanized";Kind = "Nepali";  File = "nepali_romanised.zip" }
+    @{ Name = "Nepali Romanized";Kind = "Nepali";  File = "setup.exe" }
 )
 
 $jobs = @()
