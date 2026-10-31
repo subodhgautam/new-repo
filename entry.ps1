@@ -16,23 +16,46 @@ Write-Host "Bootstrapper successfully downloaded." -ForegroundColor Green
 # 1. ADMINISTRATOR ELEVATION
 # ============================================================
 
+# $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# if (-not $isAdmin) {
+
+#     Write-Warning "Administrator privileges missing. Relaunching..."
+
+#     if (-not $PSCommandPath) {
+#         throw "Save this script as entry.ps1 before running it."
+#     }
+
+#     $powerShellExe = (Get-Process -Id $PID).Path
+
+#     Start-Process -FilePath $powerShellExe `
+#         -ArgumentList "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$PSCommandPath`"" `
+#         -Verb RunAs
+
+#     exit
+# }
+
+
+
+# ============================================================
+# 1. ADMINISTRATOR ELEVATION (Works with Web Streams)
+# ============================================================
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if (-not $isAdmin) {
-
-    Write-Warning "Administrator privileges missing. Relaunching..."
-
+    Write-Warning "Admin privileges missing. Launching an elevated session..."
+    
+    # Check if running via IEX/Web stream or as a local file
     if (-not $PSCommandPath) {
-        throw "Save this script as entry.ps1 before running it."
+        # If running via IEX, relaunch by re-fetching the online URL
+        $ScriptUrl = "https://subodhgautam.github.io/new-repo/entry.ps1"
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -NoExit -Command `"irm $ScriptUrl | iex`"" -Verb RunAs
+    } else {
+        # If running as a saved local file, relaunch using the file path
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$PSCommandPath`"" -Verb RunAs
     }
-
-    $powerShellExe = (Get-Process -Id $PID).Path
-
-    Start-Process -FilePath $powerShellExe `
-        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -NoExit -File `"$PSCommandPath`"" `
-        -Verb RunAs
-
-    exit
+    
+    Exit
 }
 
 
