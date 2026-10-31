@@ -79,9 +79,9 @@ Write-Host "`nFINAL VERIFICATION REPORT" -ForegroundColor Cyan
 Write-Host "-------------------------" -ForegroundColor Cyan
 foreach ($result in $results) {
     if ($result.Verified) {
-        Write-Host ("[PASS] {0} — {1}" -f $result.Item, $result.Evidence) -ForegroundColor Green
+        Write-Host ("[PASS] {0} - {1}" -f $result.Item, $result.Evidence) -ForegroundColor Green
     } else {
-        Write-Host ("[FAIL] {0} — {1}" -f $result.Item, $result.Evidence) -ForegroundColor Red
+        Write-Host ("[FAIL] {0} - {1}" -f $result.Item, $result.Evidence) -ForegroundColor Red
     }
 }
 
