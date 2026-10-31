@@ -62,3 +62,5 @@ try {
 catch {
     Write-Host "`nSETUP FAILED: $_" -ForegroundColor Red
 }
+
+Start-Process control.exe
