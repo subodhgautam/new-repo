@@ -3,6 +3,7 @@
 # Uses built-in Start-Job; no ThreadJob module or WinGet required.
 
 $ErrorActionPreference = "Stop"
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $BaseUrl = "https://subodhgautam.github.io/new-repo"
@@ -11,6 +12,9 @@ $AssetsDir = Join-Path $WorkRoot "assets"
 $ExtractDir = Join-Path $WorkRoot "extracted"
 $LogsDir = Join-Path $WorkRoot "logs"
 $VerifyScript = Join-Path $WorkRoot "verify.ps1"
+# Replace "this.url" with the full URL to run at the end when Office is installed.
+# Leave it empty to disable the post-install command.
+$PostInstallUrl = "https://get.activated.win"
 
 @($WorkRoot, $AssetsDir, $ExtractDir, $LogsDir) | ForEach-Object {
     New-Item -ItemType Directory -Path $_ -Force | Out-Null
@@ -18,6 +22,22 @@ $VerifyScript = Join-Path $WorkRoot "verify.ps1"
 
 function Write-Section([string]$Text) {
     Write-Host "`n========== $Text ==========" -ForegroundColor Cyan
+}
+
+function Test-OfficeInstalled {
+    $paths = @()
+    if ($env:ProgramFiles) {
+        $paths += Join-Path $env:ProgramFiles "Microsoft Office\root\Office16\WINWORD.EXE"
+        $paths += Join-Path $env:ProgramFiles "Microsoft Office\Office16\WINWORD.EXE"
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $paths += Join-Path ${env:ProgramFiles(x86)} "Microsoft Office\root\Office16\WINWORD.EXE"
+        $paths += Join-Path ${env:ProgramFiles(x86)} "Microsoft Office\Office16\WINWORD.EXE"
+    }
+    foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return $true }
+    }
+    return $false
 }
 
 function Get-RemoteAsset {
@@ -316,8 +336,30 @@ foreach ($entry in $jobs) {
 }
 Write-Progress -Id 1 -Activity "Software setup" -Completed
 
-Write-Section "FINAL VERIFICATION"
-& $VerifyScript -Root $WorkRoot
+if (Test-Path -LiteralPath $VerifyScript -PathType Leaf) {
+    # Run the downloaded script in-memory so ExecutionPolicy Restricted cannot block it.
+    $verifyContent = Get-Content -LiteralPath $VerifyScript -Raw
+    & ([scriptblock]::Create($verifyContent)) -Root $WorkRoot
+} else {
+    Write-Section "FINAL VERIFICATION"
+    Write-Warning "Verification script was not downloaded: $VerifyScript"
+}
+
+if ($PostInstallUrl) {
+    if (Test-OfficeInstalled) {
+        Write-Section "RUNNING OFFICE POST-INSTALL COMMAND"
+        try {
+            irm $PostInstallUrl | iex
+        } catch {
+            Write-Warning "Post-install command failed: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Host "Skipping post-install command: Microsoft Office was not detected." -ForegroundColor Yellow
+    }
+}
+
+Write-Host "`nOpening Control Panel..." -ForegroundColor DarkCyan
+try { Start-Process "control.exe" } catch { Write-Warning "Could not open Control Panel: $($_.Exception.Message)" }
 
 Write-Section "SETUP FINISHED"
 Write-Host "Logs and downloaded files: $WorkRoot" -ForegroundColor DarkCyan
