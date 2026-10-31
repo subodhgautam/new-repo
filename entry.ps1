@@ -28,7 +28,7 @@ try {
     }
 
     Write-Host "[OK] WinGet found." -ForegroundColor Green
-
+    winget source update
     # 2. Download configuration
     Write-Host "`n[2/3] Downloading configuration..." -ForegroundColor Yellow
 
@@ -63,4 +63,9 @@ catch {
     Write-Host "`nSETUP FAILED: $_" -ForegroundColor Red
 }
 
-Start-Process control.exe
+# Start-Process control.exe
+Write-Host "`nOpening Programs and Features..." -ForegroundColor Cyan
+
+Start-Process -FilePath "$env:WINDIR\System32\control.exe" `
+    -ArgumentList "/name Microsoft.ProgramsAndFeatures" `
+    -WindowStyle Normal
