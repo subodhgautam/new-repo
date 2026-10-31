@@ -490,11 +490,16 @@ if ($RunspacePool) { $RunspacePool.Dispose() }
 Write-Progress -Id 1 -Activity "Software setup" -Completed
 
 if (Test-Path -LiteralPath $VerifyScript -PathType Leaf) {
-    & $VerifyScript -Root $WorkRoot
+    # Run the downloaded script in-memory so ExecutionPolicy Restricted cannot block it.
+    $verifyContent = Get-Content -LiteralPath $VerifyScript -Raw
+    & ([scriptblock]::Create($verifyContent)) -Root $WorkRoot
 } else {
     Write-Section "FINAL VERIFICATION"
     Write-Warning "Verification script was not downloaded: $VerifyScript"
 }
+
+Write-Host "`nOpening Control Panel..." -ForegroundColor DarkCyan
+try { Start-Process "control.exe" } catch { Write-Warning "Could not open Control Panel: $($_.Exception.Message)" }
 
 Write-Section "SETUP FINISHED"
 Write-Host "Logs and downloaded files: $WorkRoot" -ForegroundColor DarkCyan
