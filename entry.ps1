@@ -38,12 +38,12 @@ function Get-RemoteAsset {
 Write-Section "DOWNLOAD ALL INSTALLERS AND ASSETS"
 
 $downloadItems = @(
-    @{ Url = "assets/executables/OfficeSetup.exe";       File = "OfficeSetup.exe" },
-    @{ Url = "assets/executables/ChromeSetup.exe";       File = "ChromeSetup.exe" },
+    @{ Url = "assets/executables/OfficeSetup.exe";        File = "OfficeSetup.exe" },
+    @{ Url = "assets/executables/ChromeSetup.exe";        File = "ChromeSetup.exe" },
     @{ Url = "assets/executables/AnyDesk.exe";            File = "AnyDesk.exe" },
     @{ Url = "assets/executables/winrar-x64-723.exe";     File = "winrar-x64-723.exe" },
+    @{ Url = "assets/nepali_romanised.zip";               File = "nepali_romanised.zip" },
     @{ Url = "assets/fonts.zip";                          File = "fonts.zip" },
-    @{ Url = "assets/nepali_romanised/setup.exe";               File = "setup.exe" },
     @{ Url = "scripts/verify.ps1";                        File = "verify.ps1" }
 )
 
@@ -60,7 +60,7 @@ $tasks = @(
     @{ Name = "AnyDesk";         Kind = "AnyDesk"; File = "AnyDesk.exe" },
     @{ Name = "WinRAR";          Kind = "WinRAR";  File = "winrar-x64-723.exe" },
     @{ Name = "Fonts";           Kind = "Fonts";   File = "fonts.zip" },
-    @{ Name = "Nepali Romanized";Kind = "Nepali";  File = "setup.exe" }
+    @{ Name = "Nepali Romanized";Kind = "Nepali";  File = "nepali_romanised.zip" }
 )
 
 $jobs = @()
@@ -106,13 +106,12 @@ foreach ($task in $tasks) {
         }
 
         function Invoke-Installer {
-            param([string]$FilePath, [string]$Arguments = "")
+            param([string]$FilePath, [string]$Arguments = "", [string]$WorkingDirectory = "")
             Write-WorkerLog "Launching: $([IO.Path]::GetFileName($FilePath)) $Arguments"
-            if ($Arguments) {
-                $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -Wait
-            } else {
-                $p = Start-Process -FilePath $FilePath -PassThru -Wait
-            }
+            $startParams = @{ FilePath = $FilePath; PassThru = $true; Wait = $true }
+            if ($Arguments) { $startParams.ArgumentList = $Arguments }
+            if ($WorkingDirectory) { $startParams.WorkingDirectory = $WorkingDirectory }
+            $p = Start-Process @startParams
             Write-WorkerLog "Installer process exited with code $($p.ExitCode)"
             if ($p.ExitCode -notin @(0, 1641, 3010)) {
                 throw "Installer returned exit code $($p.ExitCode)"
@@ -205,18 +204,37 @@ public static class FontBroadcast {
                 }
                 "Nepali" {
                     $dest = Join-Path $ExtractRoot "nepali_romanised"
-                    New-Item -ItemType Directory -Path $dest -Force | Out-Null
-                    Expand-Archive -LiteralPath $PayloadPath -DestinationPath $dest -Force
-
-                    $setups = @(Get-ChildItem -LiteralPath $dest -Recurse -File |
-                        Where-Object { $_.Extension -in @(".exe", ".msi") })
-                    if ($setups.Count -ne 1) {
-                        throw "Expected exactly one .exe or .msi installer in nepali_romanised.zip; found $($setups.Count)."
+                    if (Test-Path -LiteralPath $dest) {
+                        Remove-Item -LiteralPath $dest -Recurse -Force
                     }
-                    if ($setups[0].Extension -eq ".msi") {
-                        Invoke-Installer -FilePath "msiexec.exe" -Arguments "/i `"$($setups[0].FullName)`" /qn /norestart"
+                    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+
+                    # The archive is a multi-file bootstrapper: setup.exe needs its
+                    # sibling roman_<arch>.msi files and the per-architecture DLLs,
+                    # so extract everything before launching it.
+                    Expand-Archive -LiteralPath $PayloadPath -DestinationPath $dest -Force
+                    Write-WorkerLog "Extracted archive to $dest"
+
+                    $setup = Get-ChildItem -LiteralPath $dest -Recurse -File |
+                        Where-Object { $_.Name -ieq "setup.exe" } |
+                        Sort-Object { $_.FullName.Length } |
+                        Select-Object -First 1
+
+                    if ($null -eq $setup) {
+                        $msiName = if ([Environment]::Is64BitOperatingSystem) { "Roman_amd64.msi" } else { "Roman_i386.msi" }
+                        $msi = Get-ChildItem -LiteralPath $dest -Recurse -File |
+                            Where-Object { $_.Name -ieq $msiName } |
+                            Select-Object -First 1
+                        if ($null -eq $msi) {
+                            throw "No setup.exe or $msiName found after extracting nepali_romanised.zip."
+                        }
+                        Write-WorkerLog "setup.exe not found; installing $($msi.Name) directly."
+                        Invoke-Installer -FilePath "msiexec.exe" `
+                            -Arguments "/i `"$($msi.FullName)`" /qn /norestart"
                     } else {
-                        Invoke-Installer -FilePath $setups[0].FullName
+                        Write-WorkerLog "Running setup.exe from $($setup.DirectoryName)"
+                        Invoke-Installer -FilePath $setup.FullName `
+                            -WorkingDirectory $setup.DirectoryName
                     }
                 }
                 default {
@@ -278,7 +296,7 @@ while (-not $completed) {
             } catch {}
         }
         Write-Progress -Id 1 -Activity "Software setup" `
-            -Status "$($entry.Name): $state — $detail" `
+            -Status "$($entry.Name): $state - $detail" `
             -PercentComplete ((@($jobs | Where-Object { $_.Job.State -in @("Completed","Failed","Stopped") }).Count / $jobs.Count) * 100)
     }
 
