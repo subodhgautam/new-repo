@@ -8,7 +8,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 $engineUrl = "$BaseUrl/scripts/engine.ps1"
 try {
-    $engine = Invoke-RestMethod -Uri $engineUrl -UseBasicParsing
+    $engine = Invoke-RestMethod -Uri $engineUrl -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
 } catch {
     Write-Host "Could not download the installer engine: $($_.Exception.Message)" -ForegroundColor Red
     return
