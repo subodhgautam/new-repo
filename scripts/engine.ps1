@@ -34,6 +34,25 @@ function Write-Section([string]$Text) {
     Write-Host ("=" * 68) -ForegroundColor DarkCyan
 }
 
+function Stop-StaleInstallers {
+    # A previous interrupted run can leave a setup.exe alive, which makes the next
+    # installer fail with "another instance of setup is currently running".
+    # Only stop processes that belong to our own download/extract folders.
+    try {
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ExecutablePath -and (
+                    $_.ExecutablePath.StartsWith($AssetsDir, [StringComparison]::OrdinalIgnoreCase) -or
+                    $_.ExecutablePath.StartsWith($ExtractDir, [StringComparison]::OrdinalIgnoreCase)
+                )
+            } |
+            ForEach-Object {
+                Write-Host "  [cleanup] Stopping leftover installer $($_.Name) (PID $($_.ProcessId))" -ForegroundColor DarkYellow
+                try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+            }
+    } catch {}
+}
+
 function Get-WorkerEngine {
     if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) {
         return "ThreadJob"
@@ -100,7 +119,8 @@ $workerScript = {
         param(
             [string]$Uri,
             [string]$Destination,
-            [long]$MinBytes = 1024
+            [long]$MinBytes = 1024,
+            [int]$TimeoutSeconds = 300
         )
 
         $parent = Split-Path -Parent $Destination
@@ -129,7 +149,14 @@ $workerScript = {
                 $client = New-Object System.Net.WebClient
                 try {
                     $client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                    $client.DownloadFile($Uri, $candidate)
+                    # DownloadFile has no timeout of its own, so a stalled connection
+                    # could block the whole run forever. Wait on the async task instead.
+                    $download = $client.DownloadFileTaskAsync([Uri]$Uri, $candidate)
+                    if (-not $download.Wait($TimeoutSeconds * 1000)) {
+                        try { $client.CancelAsync() } catch {}
+                        throw "Download did not finish within $TimeoutSeconds seconds."
+                    }
+                    $download.GetAwaiter().GetResult()
                 } finally {
                     $client.Dispose()
                 }
@@ -178,17 +205,25 @@ $workerScript = {
         if ($WorkingDirectory) { $startParams.WorkingDirectory = $WorkingDirectory }
         $p = Start-Process @startParams
 
-        # Never let an installer that opens a hidden/interactive window freeze the whole run.
-        if ($TimeoutSeconds -gt 0) {
-            if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+        # Wait in short slices so a slow installer still prints progress instead of
+        # looking frozen, and so a genuinely hung installer cannot block forever.
+        $started = Get-Date
+        $deadline = if ($TimeoutSeconds -gt 0) { $started.AddSeconds($TimeoutSeconds) } else { $null }
+        $lastLog = $started
+        while (-not $p.HasExited) {
+            if ($deadline -and (Get-Date) -ge $deadline) {
                 try { $p.Kill() } catch {}
                 throw "$([IO.Path]::GetFileName($FilePath)) did not finish within $TimeoutSeconds seconds."
             }
-        } else {
-            $p.WaitForExit()
+            if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
+                $elapsed = [int]((Get-Date) - $started).TotalSeconds
+                Write-WorkerLog "Still running after ${elapsed}s: $([IO.Path]::GetFileName($FilePath))"
+                $lastLog = Get-Date
+            }
+            Start-Sleep -Seconds 2
+            $p.Refresh()
         }
 
-        $p.Refresh()
         $code = $p.ExitCode
         Write-WorkerLog "Installer process exited with code $code"
         if ($code -notin $AllowedExitCodes) {
@@ -210,7 +245,142 @@ $workerScript = {
         foreach ($path in $paths) {
             if (Test-Path -LiteralPath $path -PathType Leaf) { return $true }
         }
+
+        # Click-to-Run may install somewhere other than the default path; ask it.
+        foreach ($key in @(
+            "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
+        )) {
+            try {
+                $config = Get-ItemProperty -Path $key -ErrorAction Stop
+                if ($config.InstallationPath) {
+                    $word = Join-Path $config.InstallationPath "WINWORD.EXE"
+                    if (Test-Path -LiteralPath $word -PathType Leaf) { return $true }
+                }
+            } catch {}
+        }
         return $false
+    }
+
+    function Get-OfficeActivity {
+        # 17003 means "another Office install/update/uninstall is already running".
+        # OfficeClickToRun.exe /service is the always-on Click-to-Run service, so it
+        # must not be treated as an active install.
+        $servicePid = $null
+        try {
+            $servicePid = (Get-CimInstance Win32_Service -Filter "Name='ClickToRunSvc'" -ErrorAction SilentlyContinue |
+                Select-Object -First 1).ProcessId
+        } catch {}
+
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ProcessId -ne $PID -and
+            $_.ProcessId -ne $servicePid -and (
+                $_.Name -ieq 'OfficeSetup.exe' -or
+                $_.Name -ieq 'OfficeC2RClient.exe' -or
+                ($_.Name -ieq 'setup.exe' -and $_.ExecutablePath -like '*\Microsoft Shared\ClickToRun\*') -or
+                ($_.Name -ieq 'OfficeClickToRun.exe' -and $_.CommandLine -and $_.CommandLine -notmatch '(?i)/service')
+            )
+        }
+    }
+
+    function Wait-OfficeActivity {
+        param([int]$TimeoutSeconds = 900)
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        $lastLog = Get-Date
+        $announced = $false
+        while ($true) {
+            $activity = @(Get-OfficeActivity)
+            if ($activity.Count -eq 0) {
+                if ($announced) { Write-WorkerLog "Other Office setup activity finished." }
+                return $true
+            }
+            if (-not $announced) {
+                $names = ($activity | ForEach-Object { "$($_.Name) (PID $($_.ProcessId))" }) -join ', '
+                Write-WorkerLog "Waiting for other Office setup activity to finish: $names"
+                $announced = $true
+            }
+            if ((Get-Date) -ge $deadline) {
+                Write-WorkerLog "Other Office setup activity did not finish within $TimeoutSeconds seconds; stopping it and retrying."
+                foreach ($proc in $activity) {
+                    try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+                }
+                Start-Sleep -Seconds 5
+                return $false
+            }
+            if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
+                Write-WorkerLog "Still waiting for other Office setup activity ($($activity.Count) process(es))."
+                $lastLog = Get-Date
+            }
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    function Wait-OfficeInstalled {
+        param([int]$TimeoutSeconds = 300)
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        $lastLog = Get-Date
+        while ($true) {
+            if (Test-OfficeInstalled) { return $true }
+            if ((Get-Date) -ge $deadline) { return $false }
+            if (((Get-Date) - $lastLog).TotalSeconds -ge 30) {
+                Write-WorkerLog "Waiting for Office to finish registering..."
+                $lastLog = Get-Date
+            }
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    function Install-Office {
+        param(
+            [string]$PayloadPath,
+            [string]$ConfigPath
+        )
+
+        # The Office bootstrapper is only a downloader. It can return before the
+        # real Click-to-Run install finishes, and it returns 17003 while another
+        # Office install/update is running. Retry and poll instead of trusting it.
+        $maxAttempts = 3
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            if (Test-OfficeInstalled) {
+                Write-WorkerLog "Office is already installed; skipping installer."
+                return
+            }
+
+            Write-WorkerLog "Office install attempt $attempt/$maxAttempts"
+            try {
+                Invoke-Installer -FilePath $PayloadPath `
+                    -Arguments "/configure `"$ConfigPath`"" -TimeoutSeconds 3600
+
+                # Exit code 0 does not guarantee the product is registered yet.
+                if (Wait-OfficeInstalled -TimeoutSeconds 300) {
+                    Write-WorkerLog "Office installation verified."
+                    return
+                }
+                Write-WorkerLog "Office setup exited successfully, but Office is not registered yet."
+            } catch {
+                $message = $_.Exception.Message
+                Write-WorkerLog "Office attempt $attempt reported: $message"
+                if ($message -match '17003') {
+                    Write-WorkerLog "Another Office install/update is using Click-to-Run; waiting for it to finish."
+                    [void](Wait-OfficeActivity -TimeoutSeconds 900)
+                }
+
+                # Even after an error the background install can still complete,
+                # which is exactly what produced the "failed, then already
+                # installed" pattern on the next run.
+                if (Wait-OfficeInstalled -TimeoutSeconds 180) {
+                    Write-WorkerLog "Office became available after attempt $attempt; continuing."
+                    return
+                }
+            }
+
+            if ($attempt -lt $maxAttempts) {
+                $delay = 30 * $attempt
+                Write-WorkerLog "Retrying Office installation in $delay seconds."
+                Start-Sleep -Seconds $delay
+            }
+        }
+        throw "Office installation failed after $maxAttempts attempts."
     }
 
     function Test-ChromeInstalled {
@@ -311,40 +481,29 @@ $workerScript = {
                 ) -join "`r`n"
                 Set-Content -LiteralPath $configPath -Value $configXml -Encoding ASCII
                 Write-WorkerLog "Using silent Office configuration: Product=$OfficeProductId; Language=$OfficeLanguage"
-                try {
-                    Invoke-Installer -FilePath $PayloadPath -Arguments "/configure `"$configPath`"" -TimeoutSeconds 3600
-                } catch {
-                    if (Test-OfficeInstalled) {
-                        Write-WorkerLog "Office installer reported an error, but Office is present; continuing."
-                    } else {
-                        throw
-                    }
-                }
+                Install-Office -PayloadPath $PayloadPath -ConfigPath $configPath
             }
             "Chrome" {
-                $chromeOk = $false
-                for ($attempt = 1; $attempt -le 2; $attempt++) {
-                    try {
-                        Invoke-Installer -FilePath $PayloadPath -Arguments "/silent /install" -TimeoutSeconds 900
-                    } catch {
-                        Write-WorkerLog "Chrome installer attempt $attempt reported: $($_.Exception.Message)"
-                    }
+                # Single attempt only. The web installer can exit before the background
+                # install finishes, so give it time to appear instead of relaunching it.
+                try {
+                    Invoke-Installer -FilePath $PayloadPath -Arguments "/silent /install" -TimeoutSeconds 900
+                } catch {
+                    Write-WorkerLog "Chrome installer reported: $($_.Exception.Message)"
+                }
 
-                    # The web installer can exit before the background install finishes.
-                    for ($wait = 0; $wait -lt 60; $wait++) {
-                        if (Test-ChromeInstalled) { $chromeOk = $true; break }
-                        Start-Sleep -Seconds 2
-                    }
-                    if ($chromeOk) { break }
-                    if ($attempt -lt 2) {
-                        Write-WorkerLog "Chrome not detected yet; retrying installer."
-                        Start-Sleep -Seconds 5
-                    }
+                for ($wait = 0; $wait -lt 90; $wait++) {
+                    if (Test-ChromeInstalled) { break }
+                    Start-Sleep -Seconds 2
                 }
-                if (-not $chromeOk) {
-                    throw "Chrome was not detected after 2 install attempts."
+
+                if (Test-ChromeInstalled) {
+                    Write-WorkerLog "Chrome installation verified."
+                } else {
+                    Write-WorkerLog "Chrome not detected after one attempt; verification will report it."
+                    Set-WorkerStatus "Failed" "Not detected after one attempt"
+                    return
                 }
-                Write-WorkerLog "Chrome installation verified."
             }
             "AnyDesk" {
                 $anyDeskDir = Join-Path ${env:ProgramFiles(x86)} "AnyDesk"
@@ -504,6 +663,8 @@ public static class FontBroadcast {
         throw
     }
 }
+
+Stop-StaleInstallers
 
 Write-Section "START PARALLEL DOWNLOAD + INSTALL WORKERS"
 Write-Host "  Engine: $EngineLabel" -ForegroundColor DarkGray
@@ -667,12 +828,8 @@ if (Test-Path -LiteralPath $VerifyScript -PathType Leaf) {
     Write-Warning "Verification script was not downloaded: $VerifyScript"
 }
 
- 
- 
-
 Write-Host "`nOpening Programs and Features..." -ForegroundColor DarkCyan
 try { Start-Process "appwiz.cpl" } catch { Write-Warning "Could not open Programs and Features: $($_.Exception.Message)" }
-
 
 Write-Section "SETUP FINISHED"
 Write-Host "Logs and downloaded files: $WorkRoot" -ForegroundColor DarkCyan

@@ -11,10 +11,7 @@ Write-Host "       FONT INSTALLATION" -ForegroundColor Cyan
 Write-Host "==================================" -ForegroundColor Cyan
 
 # Check administrator privileges
-$isAdmin = (
-    [Security.Principal.WindowsPrincipal]
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole(
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 

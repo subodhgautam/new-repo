@@ -1,9 +1,7 @@
 # new-repo
 
-```
-irm setup.subodhgtm.com.np | iex
-```
+Run this in PowerShell:
 
-```
+```powershell
 irm https://setup.subodhgtm.com.np | iex
 ```

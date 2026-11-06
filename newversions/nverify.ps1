@@ -78,7 +78,41 @@ if ($fontInstallDir -and (Test-Path $fontInstallDir)) {
     $fontInstalledCount = @($fontSourceFiles | Where-Object { $_.Name -in $fontInstalledNames }).Count
 }
 
-$officePath = Get-FirstExistingPath $officePaths
+function Get-OfficeClickToRunPath {
+    foreach ($key in @(
+        "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
+    )) {
+        try {
+            $config = Get-ItemProperty -Path $key -ErrorAction Stop
+            if ($config.InstallationPath) {
+                $word = Join-Path $config.InstallationPath "WINWORD.EXE"
+                if (Test-Path -LiteralPath $word -PathType Leaf) { return $word }
+            }
+        } catch {}
+    }
+    return $null
+}
+
+function Wait-OfficePath([int]$TimeoutSeconds) {
+    # The Office bootstrapper can exit before Click-to-Run has finished writing
+    # the product. Give it a short grace period instead of reporting a false failure.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $announced = $false
+    while ($true) {
+        $path = Get-FirstExistingPath $officePaths
+        if (-not $path) { $path = Get-OfficeClickToRunPath }
+        if ($path) { return $path }
+        if ((Get-Date) -ge $deadline) { return $null }
+        if (-not $announced) {
+            Write-Host "Waiting for Office to finish registering..." -ForegroundColor DarkYellow
+            $announced = $true
+        }
+        Start-Sleep -Seconds 5
+    }
+}
+
+$officePath = Wait-OfficePath -TimeoutSeconds 120
 $chromePath = Get-FirstExistingPath $chromePaths
 $anyDeskPath = Get-FirstExistingPath $anyDeskPaths
 $winRarPath = Get-FirstExistingPath $winRarPaths
